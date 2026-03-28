@@ -1,5 +1,9 @@
 # Jugal's AI Options Desk
 
+## Contributor
+
+- TUNA2020
+
 Automated options research/execution engine for NIFTY/BANKNIFTY with:
 
 - Kite Connect market data (quotes, historical candles, options chain via instruments+quotes)

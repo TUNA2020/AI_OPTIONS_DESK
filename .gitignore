@@ -1,0 +1,17 @@
+.venv/
+.venv313/
+.tmp/
+.ruff_cache/
+__pycache__/
+*.pyc
+
+ai_options_desk.db
+logs/
+
+frontend-react/node_modules/
+frontend-react/dist/
+
+config/settings.yaml
+config/kite_tokens.json
+
+nul

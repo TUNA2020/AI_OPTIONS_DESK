@@ -1,0 +1,72 @@
+app:
+  mode: "paper"
+  symbol: "NIFTY 50"
+  lot_size: 50
+  timezone: "Asia/Kolkata"
+  market_open_time: "09:15"
+  market_close_time: "15:30"
+  clear_runtime_data_on_start: false
+  log_level: "INFO"
+
+kite:
+  api_key: "replace_with_kite_api_key"
+  api_secret: "replace_with_kite_api_secret"
+  product: "NRML"  # NRML | MIS
+  access_token: ""
+  refresh_token: ""
+  # Optional fallback only (short-lived; expires quickly):
+  # set KITE_REQUEST_TOKEN=your_fresh_request_token
+  request_token: ""
+  allow_request_token_from_settings: false
+  token_store_path: "config/kite_tokens.json"
+  auto_login:
+    user_id: ""
+    password: ""
+    totp_secret: ""
+    enabled: true
+    timeout_seconds: 20
+    twofa_pin: ""
+    twofa_type: "totp"
+    skip_session: true
+    max_redirect_hops: 8
+
+openrouter:
+  api_key: "replace_with_openrouter_api_key"
+  model: "openrouter/free"
+  endpoint: "https://openrouter.ai/api/v1/chat/completions"
+
+risk:
+  max_loss_per_trade: 2500
+  profit_target: 2500
+  stoploss: -2500
+  monte_carlo_paths: 1000
+  max_capital_per_trade: 100000
+  max_loss_pct_per_trade: 0
+
+scheduler:
+  decision_time: "10:00"
+  pnl_interval_seconds: 60
+  forced_exit_time: "14:45"
+  optimization_time: "15:30"
+  token_refresh_time: "08:45"
+
+api:
+  enabled: true
+  host: "127.0.0.1"
+  port: 8000
+
+dashboard:
+  frontend: "react"
+  react_host: "127.0.0.1"
+  react_port: 5173
+  refresh_seconds: 1
+  kill_switch_default: false
+  auto_optimize: true
+  deep_thinking_mode: true
+  monte_carlo: true
+
+telegram:
+  enabled: false
+  bot_token: ""
+  chat_id: ""
+  disable_notification: false

@@ -503,6 +503,16 @@ function App() {
           {pnlData?.as_of && !loadingStates.pnl && (
             <small style={{ color: "var(--muted)" }}>As of {new Date(pnlData.as_of).toLocaleTimeString()}</small>
           )}
+          {!loadingStates.pnl && pnlData && (
+            <div style={{ marginTop: "8px", display: "grid", gap: "4px" }}>
+              <small style={{ color: "var(--muted)" }}>
+                Realized: <span className={pnlColorClass(pnlData?.realized_total || 0)}>{formatNumWithSign(pnlData?.realized_total || 0)}</span>
+              </small>
+              <small style={{ color: "var(--muted)" }}>
+                Unrealized: <span className={pnlColorClass(pnlData?.unrealized_open || 0)}>{formatNumWithSign(pnlData?.unrealized_open || 0)}</span>
+              </small>
+            </div>
+          )}
         </article>
 
         <article className="panel tilt-card entry-animate">
@@ -550,9 +560,20 @@ function App() {
             </div>
           )}
           {!loadingStates.strategy && (
-            <small style={{ color: "var(--muted)" }}>
-              Last traded strategy: {strategyStatus?.active_strategy || strategyStatus?.latest_decision?.strategy || "None"}
-            </small>
+            <>
+              <small style={{ color: "var(--muted)", display: "block" }}>
+                Last traded strategy: {strategyStatus?.active_strategy || strategyStatus?.latest_decision?.strategy || "None"}
+              </small>
+              <small style={{ color: "var(--muted)", display: "block", marginTop: "6px" }}>
+                AI selection reason: {(
+                  strategyStatus?.decision_reason ||
+                  strategyStatus?.latest_decision?.reason ||
+                  strategyStatus?.latest_audit?.payload?.reason ||
+                  strategyStatus?.latest_audit?.message ||
+                  "Not available"
+                )}
+              </small>
+            </>
           )}
         </article>
 
@@ -621,7 +642,7 @@ function App() {
             <div className="tableWrap">
               <table>
                 <thead>
-                  <tr><th>Symbol</th><th>Strike</th><th>Qty</th><th>PnL</th><th>Delta</th></tr>
+                  <tr><th>Symbol</th><th>LTP</th><th>Qty</th><th>Entry</th><th>PnL</th><th>Delta</th></tr>
                 </thead>
                 <tbody>
                   {[1,2,3].map(i => (
@@ -630,6 +651,7 @@ function App() {
                       <td><Skeleton height="16px" width="40%" /></td>
                       <td><Skeleton height="16px" width="30%" /></td>
                       <td><Skeleton height="16px" width="50%" /></td>
+                      <td><Skeleton height="16px" width="60%" /></td>
                       <td><Skeleton height="16px" width="60%" /></td>
                     </tr>
                   ))}
@@ -642,22 +664,45 @@ function App() {
                 <thead>
                   <tr>
                     <th>Symbol</th>
-                    <th>Strike</th>
+                    <th>LTP</th>
                     <th>Qty</th>
+                    <th>Entry</th>
                     <th>PnL</th>
                     <th>Delta</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {positions.map((pos, idx) => (
-                    <tr key={idx}>
-                      <td>{pos.symbol || pos.option_type?.toUpperCase()}</td>
-                      <td>{pos.strike ? pos.strike.toFixed(0) : "-"}</td>
-                      <td>{pos.quantity || pos.qty || 0}</td>
-                      <td className={pnlColorClass(pos.pnl)}>{formatNumWithSign(pos.pnl)}</td>
-                      <td>{formatNum(pos.delta, 4)}</td>
-                    </tr>
-                  ))}
+                  {positions.map((pos, idx) => {
+                    const greekRow = Array.isArray(greeks?.rows)
+                      ? (
+                        greeks.rows.find((row) => Number(row?.id) === Number(pos?.id)) ||
+                        greeks.rows.find((row) =>
+                          String(row?.symbol || "") === String(pos?.symbol || "") &&
+                          String(row?.side || "").toUpperCase() === String(pos?.side || "").toUpperCase() &&
+                          Number(row?.qty || 0) === Number(pos?.qty || pos?.quantity || 0)
+                        )
+                      )
+                      : null;
+                    const qty = Number(pos.quantity ?? pos.qty ?? greekRow?.qty ?? 0);
+                    const side = String(pos.side || greekRow?.side || "BUY").toUpperCase();
+                    const entry = Number(pos.entry_price ?? pos.price ?? 0);
+                    const ltp = Number(pos.ltp ?? entry);
+                    const pnl = Number.isFinite(Number(pos.pnl))
+                      ? Number(pos.pnl)
+                      : (side === "SELL" ? (entry - ltp) : (ltp - entry)) * (Number.isFinite(qty) ? qty : 0);
+                    const deltaVal = Number(pos.delta ?? greekRow?.delta ?? 0);
+
+                    return (
+                      <tr key={idx}>
+                        <td>{pos.symbol || pos.option_type?.toUpperCase()}</td>
+                        <td>{Number.isFinite(ltp) && ltp > 0 ? formatNum(ltp) : "-"}</td>
+                        <td>{qty}</td>
+                        <td>{formatNum(entry)}</td>
+                        <td className={pnlColorClass(pnl)}>{formatNumWithSign(pnl)}</td>
+                        <td>{formatNum(deltaVal, 4)}</td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>

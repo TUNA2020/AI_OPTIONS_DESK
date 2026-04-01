@@ -163,6 +163,15 @@ def _build_heatmap_snapshot(
     latest_df = day_df[day_df["bucket_ts"] == latest_bucket].copy()
     previous_df = day_df[day_df["bucket_ts"] == previous_bucket].copy() if pd.notna(previous_bucket) else pd.DataFrame()
 
+    for col in ("ce_oi", "pe_oi"):
+        if col not in latest_df.columns:
+            latest_df[col] = 0
+        latest_df[col] = pd.to_numeric(latest_df[col], errors="coerce").fillna(0.0)
+    for col in ("ce_oi", "pe_oi"):
+        if col not in previous_df.columns:
+            previous_df[col] = 0
+        previous_df[col] = pd.to_numeric(previous_df[col], errors="coerce").fillna(0.0)
+
     if "payload" in latest_df.columns:
         latest_payload = latest_df["payload"].apply(_safe_json)
         latest_df["ce_ltp"] = latest_payload.apply(lambda p: float((p or {}).get("ce_ltp", 0.0) or 0.0))
@@ -181,6 +190,7 @@ def _build_heatmap_snapshot(
     latest_group = (
         latest_df.groupby("strike_block")[["ce_oi", "pe_oi", "ce_ltp", "pe_ltp"]]
         .agg({"ce_oi": "sum", "pe_oi": "sum", "ce_ltp": "mean", "pe_ltp": "mean"})
+        .sort_index()
         if not latest_df.empty
         else pd.DataFrame()
     )
@@ -209,25 +219,35 @@ def _build_heatmap_snapshot(
     start = max(0, center_idx - strikes_each_side)
     end = min(len(strikes), center_idx + strikes_each_side + 1)
     selected_strikes = set(strikes[start:end])
-    latest_df = latest_df[latest_df["strike"].isin(selected_strikes)].copy()
-    latest_df["strike_block"] = (
-        latest_df["strike"].astype(float) / float(block_size)
-    ).round().astype(int) * block_size
+    selected_blocks = {
+        int(round(float(strike) / float(block_size)) * block_size)
+        for strike in selected_strikes
+    }
     out = (
-        latest_df.groupby("strike_block", as_index=False)[["ce_oi", "pe_oi"]]
-        .sum()
-        .sort_values("strike_block")
+        latest_group.loc[latest_group.index.isin(selected_blocks)].reset_index().sort_values("strike_block")
+        if not latest_group.empty
+        else pd.DataFrame(columns=["strike_block", "ce_oi", "pe_oi", "ce_ltp", "pe_ltp"])
     )
 
     rows_out: list[dict[str, Any]] = []
     for _, row in out.iterrows():
         block = int(row["strike_block"])
-        latest_ce = int(row["ce_oi"] or 0)
-        latest_pe = int(row["pe_oi"] or 0)
-        latest_ce_ltp = float(row["ce_ltp"] or 0.0)
-        latest_pe_ltp = float(row["pe_ltp"] or 0.0)
-        prev_ce = int(previous_group.loc[block]["ce_oi"]) if not previous_group.empty and block in previous_group.index else 0
-        prev_pe = int(previous_group.loc[block]["pe_oi"]) if not previous_group.empty and block in previous_group.index else 0
+        latest_ce_raw = pd.to_numeric(row.get("ce_oi", 0), errors="coerce")
+        latest_pe_raw = pd.to_numeric(row.get("pe_oi", 0), errors="coerce")
+        latest_ce_ltp_raw = pd.to_numeric(row.get("ce_ltp", 0.0), errors="coerce")
+        latest_pe_ltp_raw = pd.to_numeric(row.get("pe_ltp", 0.0), errors="coerce")
+        latest_ce = int(latest_ce_raw) if pd.notna(latest_ce_raw) else 0
+        latest_pe = int(latest_pe_raw) if pd.notna(latest_pe_raw) else 0
+        latest_ce_ltp = float(latest_ce_ltp_raw) if pd.notna(latest_ce_ltp_raw) else 0.0
+        latest_pe_ltp = float(latest_pe_ltp_raw) if pd.notna(latest_pe_ltp_raw) else 0.0
+        if not previous_group.empty and block in previous_group.index:
+            prev_ce_raw = pd.to_numeric(previous_group.loc[block]["ce_oi"], errors="coerce")
+            prev_pe_raw = pd.to_numeric(previous_group.loc[block]["pe_oi"], errors="coerce")
+            prev_ce = int(prev_ce_raw) if pd.notna(prev_ce_raw) else 0
+            prev_pe = int(prev_pe_raw) if pd.notna(prev_pe_raw) else 0
+        else:
+            prev_ce = 0
+            prev_pe = 0
         ce_change = latest_ce - prev_ce
         pe_change = latest_pe - prev_pe
         rows_out.append(
@@ -954,6 +974,11 @@ def strategy_status() -> dict[str, Any]:
                 audit_reason = str(audit_payload.get("reason", "")).strip()
                 audit_message = str(latest_audit.get("message", "")).strip() if latest_audit else ""
                 decision_reason = fallback_reason or audit_reason or audit_message
+    if not decision_reason:
+        payload_reason = str(decision_payload.get("reason", "")).strip() if isinstance(decision_payload, dict) else ""
+        audit_reason = str(audit_payload.get("reason", "")).strip() if isinstance(audit_payload, dict) else ""
+        audit_message = str(latest_audit.get("message", "")).strip() if latest_audit else ""
+        decision_reason = payload_reason or audit_reason or audit_message
     decision_regime = decision_payload.get("regime") if isinstance(decision_payload.get("regime"), dict) else {}
     if not decision_regime and isinstance(audit_payload, dict):
         audit_regime = audit_payload.get("regime")

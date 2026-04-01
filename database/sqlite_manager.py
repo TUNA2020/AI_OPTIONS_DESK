@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone, timedelta
@@ -39,6 +40,10 @@ LOGGER = logging.getLogger(__name__)
 @dataclass(slots=True)
 class SQLiteManager:
     db_path: Path = Path("ai_options_desk.db")
+    connect_timeout_seconds: float = 15.0
+    busy_timeout_ms: int = 15000
+    commit_retry_attempts: int = 3
+    commit_retry_sleep_seconds: float = 0.1
 
     def __post_init__(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -46,16 +51,41 @@ class SQLiteManager:
 
     @contextmanager
     def connection(self) -> Generator[sqlite3.Connection, None, None]:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=self.connect_timeout_seconds)
         conn.row_factory = sqlite3.Row
+        self._configure_connection(conn)
         try:
             yield conn
-            conn.commit()
+            self._commit_with_retry(conn)
         except Exception:
             conn.rollback()
             raise
         finally:
             conn.close()
+
+    def _configure_connection(self, conn: sqlite3.Connection) -> None:
+        conn.execute(f"PRAGMA busy_timeout = {int(self.busy_timeout_ms)}")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+
+    def _commit_with_retry(self, conn: sqlite3.Connection) -> None:
+        for attempt in range(self.commit_retry_attempts + 1):
+            try:
+                conn.commit()
+                return
+            except sqlite3.OperationalError as exc:
+                message = str(exc).lower()
+                is_locked = "database is locked" in message or "database table is locked" in message
+                if not is_locked or attempt >= self.commit_retry_attempts:
+                    raise
+                sleep_seconds = self.commit_retry_sleep_seconds * (attempt + 1)
+                LOGGER.warning(
+                    "SQLite commit lock contention (attempt %d/%d), retrying in %.2fs",
+                    attempt + 1,
+                    self.commit_retry_attempts + 1,
+                    sleep_seconds,
+                )
+                time.sleep(sleep_seconds)
 
     def _init_db(self) -> None:
         with self.connection() as conn:

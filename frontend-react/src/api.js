@@ -53,9 +53,30 @@ export const api = {
     }),
   getMarketLatest: () => request("/market/latest"),
   getStrategyStatus: () => request("/strategy/status"),
-  getOpenTrades: () => request("/trades/open"),
-  getPositionGreeks: () => request("/positions/greeks"),
-  getOrderBlotter: (limit = 200) => request(`/orders/blotter?limit=${limit}`),
+  getOpenTrades: async () => {
+    const data = await request("/trades/open");
+    if (Array.isArray(data)) return data;
+    return Array.isArray(data?.rows) ? data.rows : [];
+  },
+  getPositionGreeks: async () => {
+    const data = await request("/positions/greeks");
+    if (!data || typeof data !== "object") {
+      return { delta: 0, gamma: 0, vega: 0, theta: 0, rows: [] };
+    }
+    const source = data?.net && typeof data.net === "object" ? data.net : data;
+    return {
+      delta: Number(source?.delta || 0),
+      gamma: Number(source?.gamma || 0),
+      vega: Number(source?.vega ?? source?.vega_per_1pct ?? 0),
+      theta: Number(source?.theta ?? source?.theta_per_day ?? 0),
+      rows: Array.isArray(data?.rows) ? data.rows : []
+    };
+  },
+  getOrderBlotter: async (limit = 200) => {
+    const data = await request(`/orders/blotter?limit=${limit}`);
+    if (Array.isArray(data)) return data;
+    return Array.isArray(data?.rows) ? data.rows : [];
+  },
   getPnlSummary: () => request("/pnl/summary"),
   getOiHeatmap: async () => {
     const data = await request("/oi/heatmap?strikes_each_side=10");
@@ -65,7 +86,11 @@ export const api = {
       strike: row?.strike ?? row?.strike_block
     }));
   },
-  getAuditEvents: (limit = 80) => request(`/audit/events?limit=${limit}`),
+  getAuditEvents: async (limit = 80) => {
+    const data = await request(`/audit/events?limit=${limit}`);
+    if (Array.isArray(data)) return data;
+    return Array.isArray(data?.rows) ? data.rows : [];
+  },
   getStrategyPayoff: () => request("/strategy/payoff")
 };
 

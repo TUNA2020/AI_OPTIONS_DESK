@@ -32,7 +32,7 @@ kite:
 
 openrouter:
   api_key: "replace_with_openrouter_api_key"
-  model: "openrouter/free"
+  model: "google/gemma-4-31b-it"
   endpoint: "https://openrouter.ai/api/v1/chat/completions"
 
 risk:

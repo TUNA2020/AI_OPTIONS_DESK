@@ -979,6 +979,8 @@ def strategy_status() -> dict[str, Any]:
         audit_reason = str(audit_payload.get("reason", "")).strip() if isinstance(audit_payload, dict) else ""
         audit_message = str(latest_audit.get("message", "")).strip() if latest_audit else ""
         decision_reason = payload_reason or audit_reason or audit_message
+    if not decision_reason:
+        decision_reason = "No strategy selection reason available yet."
     decision_regime = decision_payload.get("regime") if isinstance(decision_payload.get("regime"), dict) else {}
     if not decision_regime and isinstance(audit_payload, dict):
         audit_regime = audit_payload.get("regime")

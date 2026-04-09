@@ -22,6 +22,14 @@ function pnlColorClass(value) {
   return n > 0 ? "pnl-positive" : n < 0 ? "pnl-negative" : "";
 }
 
+function firstNonEmptyText(...values) {
+  for (const value of values) {
+    const text = String(value ?? "").trim();
+    if (text) return text;
+  }
+  return "";
+}
+
 // PayoffChart component (moved from the broken file)
 function PayoffChart({ payoff }) {
   const curve = Array.isArray(payoff?.curve) ? payoff.curve : [];
@@ -565,12 +573,15 @@ function App() {
                 Last traded strategy: {strategyStatus?.active_strategy || strategyStatus?.latest_decision?.strategy || "None"}
               </small>
               <small style={{ color: "var(--muted)", display: "block", marginTop: "6px" }}>
-                AI selection reason: {(
-                  strategyStatus?.decision_reason ||
-                  strategyStatus?.latest_decision?.reason ||
-                  strategyStatus?.latest_audit?.payload?.reason ||
-                  strategyStatus?.latest_audit?.message ||
-                  "Not available"
+                AI model: {firstNonEmptyText(strategyStatus?.ai_model, "google/gemma-4-31b-it")}
+              </small>
+              <small style={{ color: "var(--muted)", display: "block", marginTop: "6px" }}>
+                AI selection reason: {firstNonEmptyText(
+                  strategyStatus?.decision_reason,
+                  strategyStatus?.latest_decision?.reason,
+                  strategyStatus?.latest_audit?.payload?.reason,
+                  strategyStatus?.latest_audit?.message,
+                  "No strategy selection reason available yet."
                 )}
               </small>
             </>
@@ -642,13 +653,14 @@ function App() {
             <div className="tableWrap">
               <table>
                 <thead>
-                  <tr><th>Symbol</th><th>LTP</th><th>Qty</th><th>Entry</th><th>PnL</th><th>Delta</th></tr>
+                  <tr><th>Symbol</th><th>LTP</th><th>Side</th><th>Qty</th><th>Entry</th><th>PnL</th><th>Delta</th></tr>
                 </thead>
                 <tbody>
                   {[1,2,3].map(i => (
                     <tr key={i}>
                       <td><Skeleton height="16px" width="60%" /></td>
                       <td><Skeleton height="16px" width="40%" /></td>
+                      <td><Skeleton height="16px" width="45%" /></td>
                       <td><Skeleton height="16px" width="30%" /></td>
                       <td><Skeleton height="16px" width="50%" /></td>
                       <td><Skeleton height="16px" width="60%" /></td>
@@ -665,6 +677,7 @@ function App() {
                   <tr>
                     <th>Symbol</th>
                     <th>LTP</th>
+                    <th>Side</th>
                     <th>Qty</th>
                     <th>Entry</th>
                     <th>PnL</th>
@@ -685,6 +698,7 @@ function App() {
                       : null;
                     const qty = Number(pos.quantity ?? pos.qty ?? greekRow?.qty ?? 0);
                     const side = String(pos.side || greekRow?.side || "BUY").toUpperCase();
+                    const displayQty = side === "SELL" ? -Math.abs(qty) : Math.abs(qty);
                     const entry = Number(pos.entry_price ?? pos.price ?? 0);
                     const ltp = Number(pos.ltp ?? entry);
                     const pnl = Number.isFinite(Number(pos.pnl))
@@ -696,7 +710,8 @@ function App() {
                       <tr key={idx}>
                         <td>{pos.symbol || pos.option_type?.toUpperCase()}</td>
                         <td>{Number.isFinite(ltp) && ltp > 0 ? formatNum(ltp) : "-"}</td>
-                        <td>{qty}</td>
+                        <td className={side === "BUY" ? "pnl-positive" : "pnl-negative"}>{side}</td>
+                        <td>{displayQty}</td>
                         <td>{formatNum(entry)}</td>
                         <td className={pnlColorClass(pnl)}>{formatNumWithSign(pnl)}</td>
                         <td>{formatNum(deltaVal, 4)}</td>

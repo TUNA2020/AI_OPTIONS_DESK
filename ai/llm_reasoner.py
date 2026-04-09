@@ -66,7 +66,7 @@ class LLMReasoner:
 
     def _openrouter_model(self) -> str:
         model = str(self.settings.get("openrouter", {}).get("model", "")).strip()
-        return model or "openrouter/free"
+        return model or "google/gemma-4-31b-it"
 
     def _llm_enabled(self) -> bool:
         return bool(self._openrouter_api_key() and self._openrouter_endpoint())
@@ -82,7 +82,11 @@ class LLMReasoner:
     def _chat(self, messages: list[dict[str, str]]) -> str:
         endpoint = self._openrouter_endpoint()
         primary_model = self._openrouter_model()
-        candidates = [primary_model]
+        candidates: list[str] = []
+        for model in (primary_model, "openrouter/free"):
+            normalized = str(model or "").strip()
+            if normalized and normalized not in candidates:
+                candidates.append(normalized)
 
         last_error: str = ""
         for model in candidates:
@@ -105,10 +109,9 @@ class LLMReasoner:
             last_error = f"HTTP {response.status_code} for model {model}: {body[:300]}"
             if response.status_code == 404 and model != "openrouter/free":
                 LOGGER.warning(
-                    "OpenRouter model %s unavailable; falling back to openrouter/free.",
+                    "OpenRouter model %s unavailable; trying openrouter/free.",
                     model,
                 )
-                candidates = ["openrouter/free"]
                 continue
             response.raise_for_status()
 
@@ -260,7 +263,10 @@ class LLMReasoner:
             {"role": "user", "content": _json_dumps(payload)},
         ]
         if not self._llm_enabled():
-            raise RuntimeError("OpenRouter API key not configured.")
+            LOGGER.warning(
+                "OpenRouter API key not configured; using deterministic fallback proposal."
+            )
+            return self._fallback_proposal(market_context, regime, candidate_names)
         try:
             content = self._chat(messages)
             decision = json.loads(content)
@@ -290,9 +296,13 @@ class LLMReasoner:
                 "candidates": normalized,
                 "regime": regime,
             }
-        except Exception:
-            LOGGER.warning("Strategy proposal failed.")
-            raise
+        except Exception as exc:
+            LOGGER.warning(
+                "Strategy proposal failed; using deterministic fallback proposal. error=%s",
+                exc,
+            )
+            fallback = self._fallback_proposal(market_context, regime, candidate_names)
+            return fallback
 
     def choose_strategy(
         self, context: dict[str, Any], regime: dict[str, Any]
@@ -323,6 +333,66 @@ class LLMReasoner:
         decision["confidence"] = float(decision.get("confidence", 0.5))
         decision["reason"] = str(decision.get("reason", "No reason provided"))
         return decision
+
+    def _fallback_proposal(
+        self,
+        market_context: dict[str, Any],
+        regime: dict[str, Any],
+        candidate_names: list[str],
+    ) -> dict[str, Any]:
+        ranked = rank_strategy_candidates(
+            market_context,
+            regime=regime,
+            recent_performance=[],
+        )
+        ranked_names = [
+            canonical_strategy_name(str(item.get("strategy", "")))
+            for item in ranked
+            if isinstance(item, dict)
+        ]
+        ranked_names = [name for name in ranked_names if name]
+        merged: list[str] = []
+        for name in candidate_names + ranked_names:
+            clean = canonical_strategy_name(str(name))
+            if clean and clean not in merged:
+                merged.append(clean)
+        if not merged:
+            raise RuntimeError("No fallback strategy candidates available.")
+
+        primary_name = merged[0]
+        secondary_name = merged[1] if len(merged) > 1 else merged[0]
+        summary = str(regime.get("summary", "")).strip() if isinstance(regime, dict) else ""
+        regime_name = str(regime.get("regime", "range")).strip() if isinstance(regime, dict) else "range"
+        base_reason = (
+            f"LLM unavailable; using deterministic fallback aligned to {regime_name} regime."
+        )
+        if summary:
+            base_reason = f"{base_reason} {summary}"
+
+        primary = self._normalize_decision(
+            {
+                "strategy": primary_name,
+                "confidence": 0.55,
+                "reason": base_reason,
+                "capital_to_use": 50000,
+            },
+            market_context,
+        )
+        secondary = self._normalize_decision(
+            {
+                "strategy": secondary_name,
+                "confidence": 0.5,
+                "reason": "Secondary deterministic fallback candidate.",
+                "capital_to_use": 50000,
+            },
+            market_context,
+        )
+        return {
+            "primary": primary,
+            "secondary": secondary,
+            "candidates": [primary, secondary],
+            "regime": regime,
+        }
 
     def optimize_strategy_rankings(
         self, stats: list[dict[str, Any]]

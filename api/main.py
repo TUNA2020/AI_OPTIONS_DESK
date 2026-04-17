@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
+from ai.llm_reasoner import LLMReasoner
 from core.alerts import TelegramNotifier
 from core.config import load_settings
 from core.market_hours import market_session_status
@@ -51,6 +52,8 @@ app.add_middleware(
 
 _kite_client: KiteClient | None = None
 _kite_client_mode: str | None = None
+OPTION_BUYING_STRATEGY = "option_buying_vwap_put"
+OPTION_BUYING_STATE_KEY = "option_buying_strategy_state"
 
 
 class KillSwitchUpdate(BaseModel):
@@ -61,6 +64,12 @@ class KillSwitchUpdate(BaseModel):
 
 class ToggleUpdate(BaseModel):
     enabled: bool
+    reason: str = ""
+
+
+class OptionBuyingToggleUpdate(BaseModel):
+    enabled: bool
+    close_positions: bool = True
     reason: str = ""
 
 
@@ -79,6 +88,10 @@ def _quant_gate_enabled(db: SQLiteManager) -> bool:
 
 def _risk_engine_enabled(db: SQLiteManager) -> bool:
     return _runtime_control_enabled(db, "risk_engine_enabled", False)
+
+
+def _option_buying_enabled(db: SQLiteManager) -> bool:
+    return _runtime_control_enabled(db, "option_buying_enabled", True)
 
 
 def _safe_json(text: Any) -> dict[str, Any]:
@@ -356,9 +369,121 @@ def _build_quant_validator(settings: dict[str, Any]) -> QuantValidator:
     return QuantValidator()
 
 
+def _build_llm_reasoner(settings: dict[str, Any]) -> LLMReasoner:
+    return LLMReasoner(settings)
+
+
 def _manual_trade_ready(db: SQLiteManager) -> bool:
     open_trades = db.fetch_open_trades()
     return not bool(open_trades)
+
+
+def _recent_strategy_performance_rows(db: SQLiteManager, limit: int = 40) -> list[dict[str, Any]]:
+    with db.connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT strategy, date, trades_count, win_rate, avg_pnl, drawdown, sharpe, rank_score
+            FROM strategy_performance
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _fetch_latest_market_context(settings: dict[str, Any], db: SQLiteManager) -> dict[str, Any]:
+    session = _market_session(settings)
+    context_row = db.fetch_recent_context()
+    tick_row = db.fetch_recent_realtime_tick()
+    context = _safe_json(context_row["payload"]) if context_row else {}
+    tick = _safe_json(tick_row["payload"]) if tick_row else {}
+    if tick.get("nifty_price"):
+        context["nifty_price"] = float(tick["nifty_price"])
+    if tick.get("vix"):
+        context["vix"] = float(tick["vix"])
+    if tick.get("volume"):
+        context["volume"] = int(tick["volume"])
+    if tick.get("market_local_time"):
+        context["market_local_time"] = tick["market_local_time"]
+    if not context.get("market_status"):
+        context["market_open"] = bool(session["is_open"])
+        context["market_status"] = str(session["status"])
+        context["market_status_reason"] = str(session["reason"])
+        context["market_local_time"] = str(session["local_time"])
+    return context
+
+
+def _build_ai_trade_from_latest_context(
+    settings: dict[str, Any],
+    db: SQLiteManager,
+    context: dict[str, Any],
+    strict: bool = True,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], str, list[dict[str, Any]]]:
+    llm = _build_llm_reasoner(settings)
+    recent_performance = _recent_strategy_performance_rows(db)
+    deep_payload = dict(context)
+    deep_payload["recent_strategy_performance"] = recent_performance
+    regime = llm.infer_market_regime(deep_payload, strict=strict)
+    proposal = llm.propose_strategies(deep_payload, regime, strict=strict)
+
+    candidate_rows = proposal.get("candidates", []) if isinstance(proposal, dict) else []
+    if not isinstance(candidate_rows, list) or not candidate_rows:
+        candidate_rows = []
+
+    quant_enabled = _quant_gate_enabled(db)
+    if quant_enabled:
+        quant_validator = _build_quant_validator(settings)
+        quant_result = quant_validator.validate_candidates(
+            context,
+            [row for row in candidate_rows if isinstance(row, dict)]
+            if candidate_rows
+            else [proposal.get("primary", {}), proposal.get("secondary", {})],
+            regime=regime,
+        )
+        if not quant_result.get("allowed"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Quant scoring engine returned {quant_result.get('selected_strategy', 'NO TRADE')} for the current AI proposals.",
+            )
+        selected_decision = quant_result.get("selected")
+        if not isinstance(selected_decision, dict):
+            raise HTTPException(
+                status_code=409,
+                detail="Quant scoring engine returned NO TRADE for the current AI proposals.",
+            )
+    else:
+        selected_decision = dict(proposal.get("primary", {}) if isinstance(proposal, dict) else {})
+        quant_result = {
+            "allowed": True,
+            "selected": selected_decision,
+            "selected_strategy": str(selected_decision.get("strategy", "NO TRADE")),
+            "candidates": [],
+            "bypassed": True,
+            "enabled": False,
+            "reason": "Quant gate disabled via UI",
+        }
+
+    strategy_name, legs = build_trade_from_decision(selected_decision, context)
+    risk_enabled = _risk_engine_enabled(db)
+    if risk_enabled:
+        risk_manager = _build_risk_manager(settings)
+        risk_result = risk_manager.evaluate_trade(context, legs)
+        if not risk_result["allowed"]:
+            raise HTTPException(
+                status_code=409,
+                detail=str(risk_result.get("reason", "Risk rejection")),
+            )
+    else:
+        risk_result = {
+            "allowed": True,
+            "bypassed": True,
+            "enabled": False,
+            "reason": "Risk engine disabled via UI",
+            "stats": {},
+        }
+
+    return selected_decision, quant_result, risk_result, proposal, strategy_name, legs
 
 
 def _trades_df(timezone_name: str) -> pd.DataFrame:
@@ -573,6 +698,7 @@ def _seed_runtime_controls() -> None:
     db = _db()
     db.ensure_runtime_control("quant_gate_enabled", False)
     db.ensure_runtime_control("risk_engine_enabled", False)
+    db.ensure_runtime_control("option_buying_enabled", True)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -636,6 +762,7 @@ def get_controls() -> dict[str, Any]:
         "trading_mode": _current_trading_mode(settings, db),
         "quant_gate_enabled": _quant_gate_enabled(db),
         "risk_engine_enabled": _risk_engine_enabled(db),
+        "option_buying_enabled": _option_buying_enabled(db),
         "all": db.fetch_runtime_controls(),
     }
 
@@ -741,6 +868,57 @@ def update_risk_engine(payload: ToggleUpdate) -> dict[str, Any]:
     }
 
 
+@app.put("/controls/option-buying")
+def update_option_buying(payload: OptionBuyingToggleUpdate) -> dict[str, Any]:
+    settings = _settings()
+    db = _db()
+    enabled = bool(payload.enabled)
+    db.set_runtime_control("option_buying_enabled", enabled)
+    db.insert_audit_event(
+        level="INFO" if enabled else "WARNING",
+        event_type="option_buying_toggled",
+        message=f"Option buying {'enabled' if enabled else 'disabled'} via API",
+        payload={
+            "enabled": enabled,
+            "close_positions": bool(payload.close_positions),
+            "reason": payload.reason,
+        },
+    )
+
+    closed_now = 0
+    if (not enabled) and bool(payload.close_positions):
+        notifier = TelegramNotifier(settings)
+        order_manager = _build_order_manager(settings, db, notifier)
+        order_manager.refresh_mode(_current_trading_mode(settings, db))
+        option_buying_open = [
+            row
+            for row in db.fetch_open_trades()
+            if str(row.get("strategy", "")).strip() == OPTION_BUYING_STRATEGY
+        ]
+        before = len(option_buying_open)
+        if option_buying_open:
+            order_manager.close_positions(option_buying_open)
+            after_rows = [
+                row
+                for row in db.fetch_open_trades()
+                if str(row.get("strategy", "")).strip() == OPTION_BUYING_STRATEGY
+            ]
+            closed_now = max(0, before - len(after_rows))
+
+    return {
+        "option_buying_enabled": enabled,
+        "close_positions_requested": bool(payload.close_positions),
+        "closed_now": closed_now,
+        "open_option_buying_positions": len(
+            [
+                row
+                for row in db.fetch_open_trades()
+                if str(row.get("strategy", "")).strip() == OPTION_BUYING_STRATEGY
+            ]
+        ),
+    }
+
+
 @app.put("/controls/mode")
 def update_trading_mode(payload: ModeUpdate) -> dict[str, Any]:
     db = _db()
@@ -779,6 +957,64 @@ def emergency_exit(payload: ToggleUpdate | None = None) -> dict[str, Any]:
     return {
         "closed_now": closed_now,
         "open_positions_remaining": after,
+    }
+
+
+@app.post("/strategy/reenter")
+def reenter_strategy() -> dict[str, Any]:
+    settings = _settings()
+    db = _db()
+    if bool(db.get_runtime_control("kill_switch", False)):
+        raise HTTPException(status_code=409, detail="Kill switch is ON. Re-entry blocked.")
+
+    context = _fetch_latest_market_context(settings, db)
+    if not context:
+        raise HTTPException(status_code=409, detail="No market context available for re-entry.")
+    if not bool(context.get("market_open", False)):
+        raise HTTPException(status_code=409, detail="Market is closed. Re-entry is disabled.")
+
+    notifier = TelegramNotifier(settings)
+    order_manager = _build_order_manager(settings, db, notifier)
+    order_manager.refresh_mode(_current_trading_mode(settings, db))
+
+    open_trades = db.fetch_open_trades()
+    before = len(open_trades)
+    if before:
+        order_manager.close_positions(open_trades)
+    after = len(db.fetch_open_trades())
+    closed_now = max(0, before - after)
+
+    selected_decision, quant_result, risk_result, proposal, strategy_name, legs = _build_ai_trade_from_latest_context(
+        settings,
+        db,
+        context,
+        strict=True,
+    )
+
+    results = order_manager.execute_legs(strategy_name, legs)
+    db.insert_audit_event(
+        level="INFO",
+        event_type="strategy_reenter_executed",
+        message=f"Re-enter executed strategy={strategy_name}",
+        payload={
+            "closed_now": closed_now,
+            "strategy": strategy_name,
+            "decision": selected_decision,
+            "proposal": proposal,
+            "quant": quant_result,
+            "risk": risk_result,
+            "results": results,
+        },
+    )
+    return {
+        "closed_now": closed_now,
+        "strategy": strategy_name,
+        "results": results,
+        "decision": selected_decision,
+        "proposal": proposal,
+        "quant": quant_result,
+        "risk": risk_result,
+        "open_positions_remaining": len(db.fetch_open_trades()),
     }
 
 
@@ -921,6 +1157,32 @@ def strategy_status() -> dict[str, Any]:
     audit = db.fetch_audit_events(limit=1)
     latest_audit = _normalize_audit_row(audit[0]) if audit else None
     open_rows = db.fetch_open_trades()
+    option_buying_rows = [
+        row for row in open_rows if str(row.get("strategy", "")).strip() == OPTION_BUYING_STRATEGY
+    ]
+    option_buying_entries = _enrich_open_trades_with_ltp(option_buying_rows)
+    for row in option_buying_entries:
+        side = str(row.get("side", "BUY")).upper()
+        qty = int(row.get("qty", 0) or 0)
+        entry = float(row.get("price", 0.0) or 0.0)
+        ltp = float(row.get("ltp", entry) or entry)
+        pnl = (entry - ltp) * qty if side == "SELL" else (ltp - entry) * qty
+        row["pnl"] = float(pnl)
+    option_buying_profit = _unrealized_open_pnl(option_buying_rows)
+    option_buying_state_raw = db.get_runtime_control(OPTION_BUYING_STATE_KEY, {})
+    option_buying_state = (
+        dict(option_buying_state_raw) if isinstance(option_buying_state_raw, dict) else {}
+    )
+    option_buying_state["strategy"] = OPTION_BUYING_STRATEGY
+    option_buying_state["open_positions"] = len(option_buying_rows)
+    option_buying_state["active"] = bool(option_buying_rows) and bool(
+        option_buying_state.get("active", True)
+    )
+    option_buying_state["profit"] = round(float(option_buying_profit), 2)
+    option_buying_state["entries"] = option_buying_entries
+    option_buying_state.setdefault("locked_profit", 0.0)
+    option_buying_state.setdefault("candles_elapsed", 0)
+    option_buying_state.setdefault("candles_to_exit", 2)
     open_notional = float(
         sum(abs(float(r.get("price", 0.0)) * int(r.get("qty", 0))) for r in open_rows)
     )
@@ -963,7 +1225,11 @@ def strategy_status() -> dict[str, Any]:
     market_context = _safe_json(context_row.get("payload", "")) if context_row else {}
     market_trend = str(context_row.get("trend", "")).strip() if context_row else ""
     tick_row = db.fetch_recent_realtime_tick()
-    ai_model = str(settings.get("openrouter", {}).get("model", "unknown"))
+    ai_model = str(
+        settings.get("ollama", {}).get("model")
+        or settings.get("openrouter", {}).get("model")
+        or "unknown"
+    )
     audit_payload = latest_audit.get("payload", {}) if isinstance(latest_audit, dict) else {}
     if (not decision_payload or not str(decision_payload.get("strategy", "")).strip()) and isinstance(audit_payload, dict):
         fallback_decision = _proposal_to_decision(audit_payload)
@@ -1109,6 +1375,7 @@ def strategy_status() -> dict[str, Any]:
         "auto_trading_paused": auto_trading_paused,
         "quant_gate_enabled": quant_gate_enabled,
         "risk_engine_enabled": risk_engine_enabled,
+        "option_buying_enabled": _option_buying_enabled(db),
         "trading_mode": _current_trading_mode(settings, db),
         "market_regime": market_regime,
         "decision_confidence": round(confidence, 2),
@@ -1120,6 +1387,7 @@ def strategy_status() -> dict[str, Any]:
         "quant_allowed": quant_allowed,
         "latest_quant": latest_quant,
         "latest_risk": latest_risk,
+        "option_buying": option_buying_state,
         "restored_state": restored_state,
         "market_session": session,
         "can_deploy": bool(

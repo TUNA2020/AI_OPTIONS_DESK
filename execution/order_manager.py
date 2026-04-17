@@ -35,8 +35,29 @@ class OrderManager:
         except Exception:
             LOGGER.exception("Notifier send failed for %s", title)
 
+    def _validate_legs(self, strategy_name: str, legs: list[dict[str, Any]]) -> None:
+        if not isinstance(legs, list) or not legs:
+            raise ValueError(f"{strategy_name}: no legs to execute")
+        seen_symbols: set[str] = set()
+        for idx, leg in enumerate(legs):
+            if not isinstance(leg, dict):
+                raise ValueError(f"{strategy_name}: leg {idx + 1} is not an object")
+            symbol = str(leg.get("symbol", "")).strip()
+            side = str(leg.get("side", "")).upper().strip()
+            qty = int(leg.get("qty", 0) or 0)
+            if not symbol:
+                raise ValueError(f"{strategy_name}: leg {idx + 1} is missing a symbol")
+            if symbol in seen_symbols:
+                raise ValueError(f"{strategy_name}: duplicate symbol detected: {symbol}")
+            if side not in {"BUY", "SELL"}:
+                raise ValueError(f"{strategy_name}: leg {idx + 1} has invalid side {side!r}")
+            if qty <= 0:
+                raise ValueError(f"{strategy_name}: leg {idx + 1} has invalid qty {qty}")
+            seen_symbols.add(symbol)
+
     def execute_legs(self, strategy_name: str, legs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         self.refresh_mode(self.mode)
+        self._validate_legs(strategy_name, legs)
         results: list[dict[str, Any]] = []
         for leg in legs:
             symbol = str(leg["symbol"])
@@ -117,8 +138,11 @@ class OrderManager:
 
     def close_all_positions(self) -> None:
         self.refresh_mode(self.mode)
-        open_trades = self.db.fetch_open_trades()
-        for trade in open_trades:
+        self.close_positions(self.db.fetch_open_trades())
+
+    def close_positions(self, trades: list[dict[str, Any]]) -> None:
+        self.refresh_mode(self.mode)
+        for trade in trades:
             symbol = str(trade["symbol"])
             side = "BUY" if trade["side"] == "SELL" else "SELL"
             qty = int(trade["qty"])

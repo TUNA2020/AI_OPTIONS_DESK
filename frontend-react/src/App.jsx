@@ -310,7 +310,41 @@ function HeaderControls({ controls, loadingStates, onUpdate }) {
         active={!controls.auto_trading_paused}
         onClick={async () => { await onUpdate(() => api.updateAutoTrading({ enabled: controls.auto_trading_paused })); }}
       >
-        {controls.auto_trading_paused ? 'Resume' : 'Auto ON'}
+      {controls.auto_trading_paused ? 'Resume' : 'Auto ON'}
+      </ToggleButton>
+
+      <ToggleButton
+        active={false}
+        onClick={async () => {
+          if (window.confirm("Close existing open positions and re-enter a fresh AI-selected trade?")) {
+            await onUpdate(() => api.reenterTrade());
+          }
+        }}
+      >
+        Re-enter AI
+      </ToggleButton>
+
+      {/* Option Buying Kill Switch */}
+      <ToggleButton
+        active={controls.option_buying_enabled !== false}
+        onClick={async () => {
+          const currentlyEnabled = controls.option_buying_enabled !== false;
+          const nextEnabled = !currentlyEnabled;
+          if (!nextEnabled) {
+            const closePositions = window.confirm("Disable option buying and close active option-buying positions?");
+            await onUpdate(() => api.updateOptionBuying({
+              enabled: false,
+              close_positions: closePositions
+            }));
+            return;
+          }
+          await onUpdate(() => api.updateOptionBuying({
+            enabled: true,
+            close_positions: false
+          }));
+        }}
+      >
+        {(controls.option_buying_enabled !== false) ? 'OptBuy ON' : 'OptBuy OFF'}
       </ToggleButton>
 
       {/* Kill Switch */}
@@ -573,7 +607,7 @@ function App() {
                 Last traded strategy: {strategyStatus?.active_strategy || strategyStatus?.latest_decision?.strategy || "None"}
               </small>
               <small style={{ color: "var(--muted)", display: "block", marginTop: "6px" }}>
-                AI model: {firstNonEmptyText(strategyStatus?.ai_model, "google/gemma-4-31b-it")}
+                AI model: {firstNonEmptyText(strategyStatus?.ai_model, "deepseek-v3.1:671b-cloud")}
               </small>
               <small style={{ color: "var(--muted)", display: "block", marginTop: "6px" }}>
                 AI selection reason: {firstNonEmptyText(
@@ -589,57 +623,42 @@ function App() {
         </article>
 
         <article className="panel tilt-card entry-animate">
-          <div className="section-badge">Control</div>
-          <h2>Control Snapshot</h2>
-          {loadingStates.controls ? (
-            <div style={{ marginTop: "8px" }}>
-              <Skeleton height="40px" width="50%" />
-              <Skeleton height="24px" width="30%" style={{ marginTop: "8px" }} />
-            </div>
+          <div className="section-badge">Option Buying</div>
+          <h2>Paper Mode Rules</h2>
+          {loadingStates.strategy ? (
+            <Skeleton height="40px" width="60%" style={{ marginTop: "8px" }} />
           ) : (
+            <div className="stat-value" style={{ display: "flex", alignItems: "center", gap: "8px", fontSize: "1.2rem" }}>
+              <StatusIndicator
+                status={strategyStatus?.option_buying?.active ? "good" : "warn"}
+                label={strategyStatus?.option_buying?.active ? "Active" : "Idle"}
+              />
+            </div>
+          )}
+          {!loadingStates.strategy && (
             <>
-              <div style={{ display: "grid", gap: "8px", marginTop: "8px" }}>
-                <StatusIndicator
-                  status={controls?.trading_mode === "live" ? "warn" : "good"}
-                  label={`Mode: ${controls?.trading_mode === "live" ? "Live" : "Paper"}`}
-                />
-                <StatusIndicator
-                  status={controls?.quant_gate_enabled ? "good" : "danger"}
-                  label={`Quant: ${controls?.quant_gate_enabled ? "ON" : "OFF"}`}
-                />
-                <StatusIndicator
-                  status={controls?.risk_engine_enabled ? "good" : "danger"}
-                  label={`Risk: ${controls?.risk_engine_enabled ? "ON" : "OFF"}`}
-                />
-              </div>
+              <small style={{ color: "var(--muted)", display: "block" }}>
+                Strategy: {strategyStatus?.option_buying?.strategy || "option_buying_vwap_put"}
+              </small>
+              <small style={{ color: "var(--muted)", display: "block", marginTop: "6px" }}>
+                Profit: <span className={pnlColorClass(strategyStatus?.option_buying?.profit || 0)}>
+                  {formatNumWithSign(strategyStatus?.option_buying?.profit || 0)}
+                </span>
+              </small>
+              <small style={{ color: "var(--muted)", display: "block", marginTop: "6px" }}>
+                Locked Profit: {formatNumWithSign(strategyStatus?.option_buying?.locked_profit || 0)}
+              </small>
+              <small style={{ color: "var(--muted)", display: "block", marginTop: "6px" }}>
+                Candle Exit: {Number(strategyStatus?.option_buying?.candles_elapsed || 0)}/{Number(strategyStatus?.option_buying?.candles_to_exit || 2)}
+              </small>
             </>
           )}
         </article>
+
       </section>
 
       {/* Main Dashboard Grid */}
       <section className="grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(600px, 1fr))", gap: "20px" }}>
-        {/* Strategy Payoff */}
-        <article className="panel full tilt-card entry-animate">
-          <div className="section-badge">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M3 3v18h18" />
-              <path d="M18.7 8l-5.1 5.2-2.8-2.7L7 14.3" />
-            </svg>
-            Strategy Payoff
-          </div>
-          <h2>Current Position Payoff</h2>
-          {loadingStates.payoff ? (
-            <Skeleton height="300px" style={{ width: "100%" }} />
-          ) : payoff ? (
-            <div style={{ overflowX: "auto" }}>
-              <PayoffChart payoff={payoff} />
-            </div>
-          ) : (
-            <EmptyState message="No strategy payoff data" submessage="Deploy a strategy to see payoff chart" />
-          )}
-        </article>
-
         {/* Positions */}
         <article className="panel full tilt-card entry-animate">
           <div className="section-badge">
@@ -723,6 +742,90 @@ function App() {
             </div>
           ) : (
             <EmptyState message="No open positions" />
+          )}
+        </article>
+
+        <article className="panel full tilt-card entry-animate">
+          <div className="section-badge">Option Buying Entries</div>
+          <h2>Rule Strategy Legs</h2>
+          {loadingStates.strategy ? (
+            <div className="tableWrap">
+              <table>
+                <thead>
+                  <tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>LTP</th><th>PnL</th></tr>
+                </thead>
+                <tbody>
+                  {[1, 2].map((i) => (
+                    <tr key={i}>
+                      <td><Skeleton height="16px" width="60%" /></td>
+                      <td><Skeleton height="16px" width="45%" /></td>
+                      <td><Skeleton height="16px" width="35%" /></td>
+                      <td><Skeleton height="16px" width="45%" /></td>
+                      <td><Skeleton height="16px" width="45%" /></td>
+                      <td><Skeleton height="16px" width="55%" /></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : Array.isArray(strategyStatus?.option_buying?.entries) && strategyStatus.option_buying.entries.length > 0 ? (
+            <div className="tableWrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Symbol</th>
+                    <th>Side</th>
+                    <th>Qty</th>
+                    <th>Entry</th>
+                    <th>LTP</th>
+                    <th>PnL</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {strategyStatus.option_buying.entries.map((row, idx) => {
+                    const side = String(row?.side || "BUY").toUpperCase();
+                    const qty = Number(row?.qty || 0);
+                    const displayQty = side === "SELL" ? -Math.abs(qty) : Math.abs(qty);
+                    const entry = Number(row?.price || 0);
+                    const ltp = Number(row?.ltp || entry);
+                    const pnl = Number(row?.pnl || 0);
+                    return (
+                      <tr key={idx}>
+                        <td>{row?.symbol || "-"}</td>
+                        <td className={side === "BUY" ? "pnl-positive" : "pnl-negative"}>{side}</td>
+                        <td>{displayQty}</td>
+                        <td>{formatNum(entry)}</td>
+                        <td>{Number.isFinite(ltp) && ltp > 0 ? formatNum(ltp) : "-"}</td>
+                        <td className={pnlColorClass(pnl)}>{formatNumWithSign(pnl)}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <EmptyState message="No option buying entries" submessage="Entries will appear when the EMA20 setup triggers" />
+          )}
+        </article>
+
+        {/* Strategy Payoff */}
+        <article className="panel full tilt-card entry-animate">
+          <div className="section-badge">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M3 3v18h18" />
+              <path d="M18.7 8l-5.1 5.2-2.8-2.7L7 14.3" />
+            </svg>
+            Strategy Payoff
+          </div>
+          <h2>Current Position Payoff</h2>
+          {loadingStates.payoff ? (
+            <Skeleton height="300px" style={{ width: "100%" }} />
+          ) : payoff ? (
+            <div style={{ overflowX: "auto" }}>
+              <PayoffChart payoff={payoff} />
+            </div>
+          ) : (
+            <EmptyState message="No strategy payoff data" submessage="Deploy a strategy to see payoff chart" />
           )}
         </article>
 

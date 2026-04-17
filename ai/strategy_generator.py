@@ -14,6 +14,7 @@ from strategies.gamma_scalping import Strategy as GammaScalping
 from strategies.iron_condor import Strategy as IronCondor
 from strategies.momentum_volatility import Strategy as MomentumVolatility
 from strategies.oi_wall_strategy import Strategy as OIWallStrategy
+from strategies.option_buying_vwap_put import Strategy as OptionBuyingVwapPut
 from strategies.ratio_spread import Strategy as RatioSpread
 from strategies.short_strangle import Strategy as ShortStrangle
 from strategies.skew_arbitrage import Strategy as SkewArbitrage
@@ -37,6 +38,7 @@ STRATEGY_REGISTRY = {
     "skew_arbitrage": SkewArbitrage,
     "expiry_range_trade": ExpiryRangeTrade,
     "momentum_volatility": MomentumVolatility,
+    "option_buying_vwap_put": OptionBuyingVwapPut,
 }
 
 # Default strike selection parameters for each strategy (tunable by AI)
@@ -59,6 +61,7 @@ STRATEGY_DEFAULTS: dict[str, dict[str, Any]] = {
     "trend_credit_spread": {},  # delegates to bull_put or bear_call
     "expiry_range_trade": {},  # delegates to short_strangle
     "momentum_volatility": {},  # delegates to gamma_scalping or trend_credit
+    "option_buying_vwap_put": {},  # ATM PE single-leg buy
 }
 
 
@@ -108,6 +111,9 @@ STRATEGY_ALIASES = {
     "range_trade": "expiry_range_trade",
     "momentum_volatility": "momentum_volatility",
     "momentum volatility": "momentum_volatility",
+    "option_buying_vwap_put": "option_buying_vwap_put",
+    "option buying vwap put": "option_buying_vwap_put",
+    "atm_put_buy": "option_buying_vwap_put",
 }
 
 REGIME_PRIORS = {
@@ -360,6 +366,119 @@ def _option_type_from_symbol(symbol: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _symbol_strike(symbol: str) -> int | None:
+    match = re.search(r"(\d+)(?:CE|PE)$", symbol.upper())
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except Exception:
+        return None
+
+
+def _available_strikes(context: dict[str, Any], option_type: str) -> list[int]:
+    chain = context.get("option_chain", [])
+    strikes: list[int] = []
+    key = "ce_symbol" if option_type == "CE" else "pe_symbol"
+    for row in chain:
+        if key not in row:
+            continue
+        try:
+            strike = int(float(row.get("strike", 0) or 0))
+        except Exception:
+            continue
+        if strike > 0:
+            strikes.append(strike)
+    return sorted(set(strikes))
+
+
+def _shift_strike(context: dict[str, Any], strike: int, option_type: str, side: str) -> int:
+    strikes = _available_strikes(context, option_type)
+    if not strikes:
+        return int(strike)
+    side = str(side).upper()
+    ordered = sorted(strikes)
+    if option_type == "CE":
+        candidates = [value for value in ordered if value >= strike] if side == "BUY" else [value for value in ordered if value <= strike]
+        if candidates:
+            return min(candidates) if side == "BUY" else max(candidates)
+    else:
+        candidates = [value for value in ordered if value <= strike] if side == "BUY" else [value for value in ordered if value >= strike]
+        if candidates:
+            return max(candidates) if side == "BUY" else min(candidates)
+
+    chosen = min(ordered, key=lambda value: (abs(value - strike), value))
+    if chosen == strike and len(ordered) > 1:
+        alternatives = [value for value in ordered if value != strike]
+        if alternatives:
+            if option_type == "CE":
+                return min(alternatives) if side == "BUY" else max(alternatives)
+            return max(alternatives) if side == "BUY" else min(alternatives)
+    return chosen
+
+
+def _apply_strike_plan(
+    legs: list[dict[str, Any]],
+    decision: dict[str, Any],
+    context: dict[str, Any],
+) -> list[dict[str, Any]]:
+    strike_plan = decision.get("strike_plan")
+    if not isinstance(strike_plan, dict) or not strike_plan:
+        return legs
+
+    updated: list[dict[str, Any]] = []
+    for leg in legs:
+        symbol = str(leg.get("symbol", ""))
+        side = str(leg.get("side", "")).upper()
+        option_type = _option_type_from_symbol(symbol)
+        if not option_type:
+            updated.append(dict(leg))
+            continue
+
+        target_strike: Any = None
+        option_plan = strike_plan.get(option_type)
+        if isinstance(option_plan, dict):
+            target_strike = option_plan.get(side) or option_plan.get("strike") or option_plan.get("default")
+        if target_strike is None:
+            target_strike = decision.get(f"{option_type.lower()}_strike")
+
+        try:
+            target_int = int(float(target_strike))
+        except Exception:
+            target_int = 0
+
+        if target_int > 0:
+            resolved = _nearest_symbol(context, target_int, option_type)
+            if resolved:
+                symbol = resolved
+        updated.append({**leg, "symbol": symbol})
+
+    return _ensure_unique_leg_symbols(updated, context)
+
+
+def _ensure_unique_leg_symbols(
+    legs: list[dict[str, Any]],
+    context: dict[str, Any],
+) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    updated: list[dict[str, Any]] = []
+    for leg in legs:
+        symbol = str(leg.get("symbol", ""))
+        option_type = _option_type_from_symbol(symbol)
+        side = str(leg.get("side", "")).upper()
+        if symbol and symbol in seen and option_type:
+            strike = _symbol_strike(symbol)
+            if strike is not None:
+                shifted = _shift_strike(context, strike, option_type, side)
+                resolved = _nearest_symbol(context, shifted, option_type)
+                if resolved:
+                    symbol = resolved
+        if symbol:
+            seen.add(symbol)
+        updated.append({**leg, "symbol": symbol})
+    return updated
+
+
 def _apply_strike_overrides(
     legs: list[dict[str, Any]], decision: dict[str, Any], context: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -375,7 +494,7 @@ def _apply_strike_overrides(
         if side == "SELL" and option_type == "PE" and pe_override:
             symbol = _nearest_symbol(context, pe_override, "PE") or symbol
         updated.append({**leg, "symbol": symbol})
-    return updated
+    return _ensure_unique_leg_symbols(updated, context)
 
 
 def build_trade_from_decision(
@@ -407,8 +526,12 @@ def build_trade_from_decision(
     # Build trade with parameters
     legs = strategy.build_trade(context, **params)
 
+    legs = _apply_strike_plan(legs, decision, context)
+
     # Legacy: Apply explicit strike overrides if provided (direct strike control)
     if "ce_strike" in decision or "pe_strike" in decision:
         legs = _apply_strike_overrides(legs, decision, context)
+
+    legs = _ensure_unique_leg_symbols(legs, context)
 
     return strategy.name, legs

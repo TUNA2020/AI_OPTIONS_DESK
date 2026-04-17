@@ -37,6 +37,11 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(payload)
     }),
+  updateOptionBuying: (payload) =>
+    request("/controls/option-buying", {
+      method: "PUT",
+      body: JSON.stringify(payload)
+    }),
   updateTradingMode: (payload) =>
     request("/controls/mode", {
       method: "PUT",
@@ -46,6 +51,10 @@ export const api = {
     request("/controls/emergency-exit", {
       method: "POST",
       body: JSON.stringify(payload || {})
+    }),
+  reenterTrade: () =>
+    request("/strategy/reenter", {
+      method: "POST"
     }),
   deployStrategy: () =>
     request("/strategy/deploy", {

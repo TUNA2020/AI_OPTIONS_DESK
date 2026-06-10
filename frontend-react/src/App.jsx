@@ -1,7 +1,12 @@
-import React, { useState, useEffect } from "react";
-import DayWisePnlPage from "./pages/DayWisePnlPage";
+﻿import React, { lazy, Suspense, useState, useEffect } from "react";
 import { api } from "./api";
+import AnimatedNumber from "./components/AnimatedNumber";
+import { usePanelEntrance, useMagneticButtons, useHeroReveal } from "./hooks/useGsapEffects";
 import "./styles.css";
+
+const DayWisePnlPage = lazy(() => import("./pages/DayWisePnlPage"));
+// three.js is heavy — stream the 3D backdrop in after the dashboard paints
+const ThreeBackground = lazy(() => import("./components/ThreeBackground"));
 
 // Helper functions (shared from DayWisePnlPage)
 function formatNum(value, digits = 2) {
@@ -83,7 +88,7 @@ function PayoffChart({ payoff }) {
   const spotPnl = interpolatePnl(curve, spot);
 
   return (
-    <div className="payoffCard tilt-card entry-animate">
+    <div className="payoffCard tilt-card gsap-panel">
       <div className="payoffMeta">
         <div>
           <div className="payoffLabel">Strategy</div>
@@ -289,22 +294,6 @@ function HeaderControls({ controls, loadingStates, onUpdate }) {
         </ModeButton>
       </div>
 
-      {/* Quant Gate */}
-      <ToggleButton
-        active={controls.quant_gate_enabled}
-        onClick={async () => { await onUpdate(() => api.updateQuantGate({ enabled: !controls.quant_gate_enabled })); }}
-      >
-        {controls.quant_gate_enabled ? 'Quant ON' : 'Bypass Quant'}
-      </ToggleButton>
-
-      {/* Risk Engine */}
-      <ToggleButton
-        active={controls.risk_engine_enabled}
-        onClick={async () => { await onUpdate(() => api.updateRiskEngine({ enabled: !controls.risk_engine_enabled })); }}
-      >
-        {controls.risk_engine_enabled ? 'Risk ON' : 'Bypass Risk'}
-      </ToggleButton>
-
       {/* Auto Trading */}
       <ToggleButton
         active={!controls.auto_trading_paused}
@@ -369,25 +358,29 @@ function App() {
   const [marketData, setMarketData] = useState(null);
   const [positions, setPositions] = useState(null);
   const [greeks, setGreeks] = useState(null);
-  const [heatmap, setHeatmap] = useState(null);
   const [strategyStatus, setStrategyStatus] = useState(null);
   const [payoff, setPayoff] = useState(null);
   const [ blotter, setBlotter] = useState(null);
   const [auditEvents, setAuditEvents] = useState(null);
   const [config, setConfig] = useState(null);
   const [controls, setControls] = useState(null);
+  const [llmHealth, setLlmHealth] = useState(null);
+  useHeroReveal();
+  useMagneticButtons();
+  usePanelEntrance([currentPage]);
+
   const [loadingStates, setLoadingStates] = useState({
     pnl: true,
     market: true,
     positions: true,
     greeks: true,
-    heatmap: true,
     strategy: true,
     payoff: true,
     blotter: true,
     audit: true,
     config: true,
-    controls: true
+    controls: true,
+    llmHealth: true
   });
 
   // Fetch data progressively
@@ -401,10 +394,16 @@ function App() {
     };
 
     async function fetchDataWithTimeout(fn, key) {
+      let timeoutId = null;
       try {
-        const timeoutId = setTimeout(() => { throw new Error('Timeout'); }, 5000);
-        const data = await fn();
-        clearTimeout(timeoutId);
+        const timeoutPromise = new Promise((_, reject) => {
+          timeoutId = setTimeout(() => reject(new Error("Timeout")), 5000);
+        });
+        const data = await Promise.race([
+          fn(),
+          timeoutPromise
+        ]);
+        if (timeoutId) clearTimeout(timeoutId);
         if (mounted) {
           // Update data based on key
           switch (key) {
@@ -415,17 +414,18 @@ function App() {
             case 'market': setMarketData(data); break;
             case 'positions': setPositions(data); break;
             case 'greeks': setGreeks(data); break;
-            case 'heatmap': setHeatmap(data); break;
             case 'strategy': setStrategyStatus(data); break;
             case 'payoff': setPayoff(data); break;
             case 'blotter': setBlotter(data); break;
             case 'audit': setAuditEvents(data); break;
             case 'config': setConfig(data); break;
             case 'controls': setControls(data); break;
+            case 'llmHealth': setLlmHealth(data); break;
           }
           setLoadingState(key, false);
         }
       } catch (err) {
+        if (timeoutId) clearTimeout(timeoutId);
         console.warn(`Failed to fetch ${key}:`, err.message);
         setLoadingState(key, false); // Still mark as not loading to show empty state
       }
@@ -447,9 +447,9 @@ function App() {
       fetchDataWithTimeout(() => api.getStrategyPayoff(), 'payoff');
       fetchDataWithTimeout(() => api.getOrderBlotter(50), 'blotter');
       fetchDataWithTimeout(() => api.getAuditEvents(30), 'audit');
-      fetchDataWithTimeout(() => api.getOiHeatmap(), 'heatmap');
       fetchDataWithTimeout(() => api.getControls(), 'controls');
       fetchDataWithTimeout(() => api.getConfig(), 'config');
+      fetchDataWithTimeout(() => api.getLlmHealth(), 'llmHealth');
 
       if (mounted) {
         setLoadingStates(s => ({ ...s, initial: false }));
@@ -473,8 +473,8 @@ function App() {
         api.getStrategyPayoff().then(setPayoff),
         api.getOrderBlotter(50).then(setBlotter),
         api.getAuditEvents(30).then(setAuditEvents),
-        api.getOiHeatmap().then(setHeatmap),
-        api.getConfig().then(setConfig)
+        api.getConfig().then(setConfig),
+        api.getLlmHealth().then(setLlmHealth)
       ]);
     }, 10000);
 
@@ -529,17 +529,19 @@ function App() {
   const renderDashboard = () => (
     <>
       {/* Top Stats Row */}
-      <section className="grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", marginBottom: "24px" }}>
-        <article className="panel tilt-card entry-animate">
+      <section className="grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", marginBottom: "24px" }}>
+        <article className="panel tilt-card gsap-panel">
           <div className="section-badge">Portfolio</div>
           <h2>Total P&L</h2>
           {loadingStates.pnl ? (
             <Skeleton height="60px" style={{ marginTop: "8px" }} />
           ) : (
-            <div className="stat-value" style={{ fontSize: "2.5rem", fontWeight: 700 }}>
-              <span className={pnlColorClass(pnlData?.total_pnl || 0)}>
-                {formatNumWithSign(pnlData?.total_pnl || 0)}
-              </span>
+            <div className="stat-value stat-big">
+              <AnimatedNumber
+                value={pnlData?.total_pnl || 0}
+                signed
+                className={pnlColorClass(pnlData?.total_pnl || 0)}
+              />
             </div>
           )}
           {pnlData?.as_of && !loadingStates.pnl && (
@@ -557,28 +559,41 @@ function App() {
           )}
         </article>
 
-        <article className="panel tilt-card entry-animate">
+        <article className="panel tilt-card gsap-panel">
           <div className="section-badge">Market</div>
-          <h2>LTP ({config?.app?.symbol || "Index"})</h2>
+          <h2>NIFTY 50</h2>
           {loadingStates.market ? (
             <Skeleton height="60px" style={{ marginTop: "8px" }} />
           ) : (
             <>
-              <div className="stat-value" style={{ fontSize: "2.5rem", fontWeight: 700 }}>
+              <div className="stat-value stat-big">
                 {Number.isFinite(Number(marketData?.context?.nifty_price ?? marketData?.tick?.nifty_price ?? marketData?.spot))
-                  ? Number(marketData?.context?.nifty_price ?? marketData?.tick?.nifty_price ?? marketData?.spot).toFixed(2)
+                  ? (
+                    <AnimatedNumber
+                      value={Number(marketData?.context?.nifty_price ?? marketData?.tick?.nifty_price ?? marketData?.spot)}
+                    />
+                  )
                   : "-"}
               </div>
-              {Number.isFinite(Number(marketData?.context?.vwap ?? marketData?.vwap)) && (
-                <small style={{ color: "var(--muted)" }}>
-                  VWAP: {Number(marketData?.context?.vwap ?? marketData?.vwap).toFixed(2)}
-                </small>
-              )}
+              <div style={{ marginTop: "8px", display: "grid", gap: "4px" }}>
+                {Number.isFinite(Number(marketData?.context?.vwap ?? marketData?.vwap)) && (
+                  <small style={{ color: "var(--muted)" }}>
+                    VWAP: {Number(marketData?.context?.vwap ?? marketData?.vwap).toFixed(2)}
+                  </small>
+                )}
+                {Number.isFinite(Number(marketData?.context?.vix ?? marketData?.vix)) && Number(marketData?.context?.vix ?? marketData?.vix) > 0 && (
+                  <small style={{ color: "var(--muted)" }}>
+                    VIX: <span style={{ color: Number(marketData?.context?.vix ?? marketData?.vix) > 20 ? "var(--danger)" : "var(--success)" }}>
+                      {Number(marketData?.context?.vix ?? marketData?.vix).toFixed(2)}
+                    </span>
+                  </small>
+                )}
+              </div>
             </>
           )}
         </article>
 
-        <article className="panel tilt-card entry-animate">
+        <article className="panel tilt-card gsap-panel">
           <div className="section-badge">Strategy</div>
           <h2>Status</h2>
           {loadingStates.strategy ? (
@@ -604,52 +619,47 @@ function App() {
           {!loadingStates.strategy && (
             <>
               <small style={{ color: "var(--muted)", display: "block" }}>
-                Last traded strategy: {strategyStatus?.active_strategy || strategyStatus?.latest_decision?.strategy || "None"}
+                Strategy: {strategyStatus?.active_strategy || strategyStatus?.latest_decision?.strategy || "None"}
               </small>
               <small style={{ color: "var(--muted)", display: "block", marginTop: "6px" }}>
-                AI model: {firstNonEmptyText(strategyStatus?.ai_model, "deepseek-v3.1:671b-cloud")}
+                {(() => {
+                  const reason = firstNonEmptyText(
+                    strategyStatus?.decision_reason,
+                    strategyStatus?.latest_decision?.reason,
+                    strategyStatus?.latest_audit?.payload?.reason,
+                    strategyStatus?.latest_audit?.message,
+                    ""
+                  );
+                  if (!reason) return null;
+                  // Strip any "LLM unavailable; using deterministic fallback..." prefix
+                  const clean = reason.replace(/^LLM unavailable[^.]*\.\s*/i, "").replace(/^using deterministic fallback[^.]*\.\s*/i, "").trim();
+                  if (!clean) return null;
+                  return clean.length > 120 ? clean.slice(0, 120) + "…" : clean;
+                })()}
               </small>
               <small style={{ color: "var(--muted)", display: "block", marginTop: "6px" }}>
-                AI selection reason: {firstNonEmptyText(
-                  strategyStatus?.decision_reason,
-                  strategyStatus?.latest_decision?.reason,
-                  strategyStatus?.latest_audit?.payload?.reason,
-                  strategyStatus?.latest_audit?.message,
-                  "No strategy selection reason available yet."
+                LLM: {firstNonEmptyText(
+                  strategyStatus?.llm_health?.last?.last_status,
+                  llmHealth?.cached?.last?.last_status,
+                  llmHealth?.live?.last?.last_status,
+                  "unknown"
                 )}
-              </small>
-            </>
-          )}
-        </article>
-
-        <article className="panel tilt-card entry-animate">
-          <div className="section-badge">Option Buying</div>
-          <h2>Paper Mode Rules</h2>
-          {loadingStates.strategy ? (
-            <Skeleton height="40px" width="60%" style={{ marginTop: "8px" }} />
-          ) : (
-            <div className="stat-value" style={{ display: "flex", alignItems: "center", gap: "8px", fontSize: "1.2rem" }}>
-              <StatusIndicator
-                status={strategyStatus?.option_buying?.active ? "good" : "warn"}
-                label={strategyStatus?.option_buying?.active ? "Active" : "Idle"}
-              />
-            </div>
-          )}
-          {!loadingStates.strategy && (
-            <>
-              <small style={{ color: "var(--muted)", display: "block" }}>
-                Strategy: {strategyStatus?.option_buying?.strategy || "option_buying_vwap_put"}
-              </small>
-              <small style={{ color: "var(--muted)", display: "block", marginTop: "6px" }}>
-                Profit: <span className={pnlColorClass(strategyStatus?.option_buying?.profit || 0)}>
-                  {formatNumWithSign(strategyStatus?.option_buying?.profit || 0)}
-                </span>
-              </small>
-              <small style={{ color: "var(--muted)", display: "block", marginTop: "6px" }}>
-                Locked Profit: {formatNumWithSign(strategyStatus?.option_buying?.locked_profit || 0)}
-              </small>
-              <small style={{ color: "var(--muted)", display: "block", marginTop: "6px" }}>
-                Candle Exit: {Number(strategyStatus?.option_buying?.candles_elapsed || 0)}/{Number(strategyStatus?.option_buying?.candles_to_exit || 2)}
+                {" · "}
+                {firstNonEmptyText(
+                  llmHealth?.active_provider,
+                  strategyStatus?.llm_health?.last?.last_provider,
+                  llmHealth?.cached?.last?.last_provider,
+                  llmHealth?.live?.last?.last_provider,
+                  "n/a"
+                )}
+                {" · "}
+                {firstNonEmptyText(
+                  llmHealth?.active_model,
+                  strategyStatus?.llm_health?.last?.last_model,
+                  llmHealth?.cached?.last?.last_model,
+                  llmHealth?.live?.last?.last_model,
+                  "n/a"
+                )}
               </small>
             </>
           )}
@@ -660,7 +670,7 @@ function App() {
       {/* Main Dashboard Grid */}
       <section className="grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(600px, 1fr))", gap: "20px" }}>
         {/* Positions */}
-        <article className="panel full tilt-card entry-animate">
+        <article className="panel full tilt-card gsap-panel">
           <div className="section-badge">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" />
@@ -719,7 +729,11 @@ function App() {
                     const side = String(pos.side || greekRow?.side || "BUY").toUpperCase();
                     const displayQty = side === "SELL" ? -Math.abs(qty) : Math.abs(qty);
                     const entry = Number(pos.entry_price ?? pos.price ?? 0);
-                    const ltp = Number(pos.ltp ?? entry);
+                    // Ensure LTP is valid; if not > 0.5, likely stale/incorrect, use entry as fallback
+                    let ltp = Number(pos.ltp ?? entry);
+                    if (!Number.isFinite(ltp) || ltp < 0.5) {
+                      ltp = entry;
+                    }
                     const pnl = Number.isFinite(Number(pos.pnl))
                       ? Number(pos.pnl)
                       : (side === "SELL" ? (entry - ltp) : (ltp - entry)) * (Number.isFinite(qty) ? qty : 0);
@@ -728,11 +742,11 @@ function App() {
                     return (
                       <tr key={idx}>
                         <td>{pos.symbol || pos.option_type?.toUpperCase()}</td>
-                        <td>{Number.isFinite(ltp) && ltp > 0 ? formatNum(ltp) : "-"}</td>
+                        <td>{Number.isFinite(ltp) && ltp > 0 ? formatNum(ltp, 2) : "-"}</td>
                         <td className={side === "BUY" ? "pnl-positive" : "pnl-negative"}>{side}</td>
                         <td>{displayQty}</td>
-                        <td>{formatNum(entry)}</td>
-                        <td className={pnlColorClass(pnl)}>{formatNumWithSign(pnl)}</td>
+                        <td>{formatNum(entry, 2)}</td>
+                        <td className={pnlColorClass(pnl)}>{formatNumWithSign(pnl, 2)}</td>
                         <td>{formatNum(deltaVal, 4)}</td>
                       </tr>
                     );
@@ -745,71 +759,8 @@ function App() {
           )}
         </article>
 
-        <article className="panel full tilt-card entry-animate">
-          <div className="section-badge">Option Buying Entries</div>
-          <h2>Rule Strategy Legs</h2>
-          {loadingStates.strategy ? (
-            <div className="tableWrap">
-              <table>
-                <thead>
-                  <tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>LTP</th><th>PnL</th></tr>
-                </thead>
-                <tbody>
-                  {[1, 2].map((i) => (
-                    <tr key={i}>
-                      <td><Skeleton height="16px" width="60%" /></td>
-                      <td><Skeleton height="16px" width="45%" /></td>
-                      <td><Skeleton height="16px" width="35%" /></td>
-                      <td><Skeleton height="16px" width="45%" /></td>
-                      <td><Skeleton height="16px" width="45%" /></td>
-                      <td><Skeleton height="16px" width="55%" /></td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          ) : Array.isArray(strategyStatus?.option_buying?.entries) && strategyStatus.option_buying.entries.length > 0 ? (
-            <div className="tableWrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Symbol</th>
-                    <th>Side</th>
-                    <th>Qty</th>
-                    <th>Entry</th>
-                    <th>LTP</th>
-                    <th>PnL</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {strategyStatus.option_buying.entries.map((row, idx) => {
-                    const side = String(row?.side || "BUY").toUpperCase();
-                    const qty = Number(row?.qty || 0);
-                    const displayQty = side === "SELL" ? -Math.abs(qty) : Math.abs(qty);
-                    const entry = Number(row?.price || 0);
-                    const ltp = Number(row?.ltp || entry);
-                    const pnl = Number(row?.pnl || 0);
-                    return (
-                      <tr key={idx}>
-                        <td>{row?.symbol || "-"}</td>
-                        <td className={side === "BUY" ? "pnl-positive" : "pnl-negative"}>{side}</td>
-                        <td>{displayQty}</td>
-                        <td>{formatNum(entry)}</td>
-                        <td>{Number.isFinite(ltp) && ltp > 0 ? formatNum(ltp) : "-"}</td>
-                        <td className={pnlColorClass(pnl)}>{formatNumWithSign(pnl)}</td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          ) : (
-            <EmptyState message="No option buying entries" submessage="Entries will appear when the EMA20 setup triggers" />
-          )}
-        </article>
-
         {/* Strategy Payoff */}
-        <article className="panel full tilt-card entry-animate">
+        <article className="panel full tilt-card gsap-panel">
           <div className="section-badge">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <path d="M3 3v18h18" />
@@ -829,141 +780,8 @@ function App() {
           )}
         </article>
 
-        {/* Greeks */}
-        <article className="panel full tilt-card entry-animate">
-          <div className="section-badge">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <circle cx="12" cy="12" r="10" />
-              <path d="M12 6v6l4 2" />
-            </svg>
-            Portfolio Greeks
-          </div>
-          <h2>Risk Exposure</h2>
-          {loadingStates.greeks ? (
-            <div className="grid" style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "16px" }}>
-              {[1,2,3,4].map(i => (
-                <div key={i} className="stat-card">
-                  <Skeleton height="14px" width="40%" style={{ marginBottom: "8px" }} />
-                  <Skeleton height="36px" width="70%" />
-                </div>
-              ))}
-            </div>
-          ) : greeks ? (
-            <div className="grid" style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "16px" }}>
-              <div className="stat-card">
-                <div className="stat-label">Delta</div>
-                <div className="stat-value" style={{ fontSize: "1.8rem", color: "var(--info)" }}>{formatNum(greeks.delta, 2)}</div>
-              </div>
-              <div className="stat-card">
-                <div className="stat-label">Gamma</div>
-                <div className="stat-value" style={{ fontSize: "1.8rem", color: "var(--warning)" }}>{formatNum(greeks.gamma, 6)}</div>
-              </div>
-              <div className="stat-card">
-                <div className="stat-label">Vega</div>
-                <div className="stat-value" style={{ fontSize: "1.8rem", color: "var(--accent)" }}>{formatNum(greeks.vega, 2)}</div>
-              </div>
-              <div className="stat-card">
-                <div className="stat-label">Theta</div>
-                <div className="stat-value" style={{ fontSize: "1.8rem", color: "var(--danger)" }}>{formatNum(greeks.theta, 2)}</div>
-              </div>
-            </div>
-          ) : (
-            <EmptyState message="No Greeks data" />
-          )}
-        </article>
-
-        {/* OI Heatmap */}
-        <article className="panel full tilt-card entry-animate">
-          <div className="section-badge">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <rect x="3" y="3" width="18" height="18" rx="2" />
-              <path d="M3 9h18M9 21V9" />
-            </svg>
-            OI Heatmap
-          </div>
-          <h2>Open Interest Concentration</h2>
-          {loadingStates.heatmap ? (
-            <div className="tableWrap">
-              <table>
-                <thead>
-                  <tr><th>Strike</th><th>CE OI</th><th>PE OI</th><th>Total</th><th>CE LTP</th><th>PE LTP</th></tr>
-                </thead>
-                <tbody>
-                  {[1,2,3,4,5].map(i => (
-                    <tr key={i}>
-                      <td><Skeleton height="16px" width="30%" /></td>
-                      <td><Skeleton height="16px" width="50%" /></td>
-                      <td><Skeleton height="16px" width="50%" /></td>
-                      <td><Skeleton height="16px" width="40%" /></td>
-                      <td><Skeleton height="16px" width="40%" /></td>
-                      <td><Skeleton height="16px" width="40%" /></td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          ) : heatmap && heatmap.length > 0 ? (
-            <div className="tableWrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Strike</th>
-                    <th>CE OI</th>
-                    <th>PE OI</th>
-                    <th>Total</th>
-                    <th>CE LTP</th>
-                    <th>PE LTP</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {(() => {
-                    const spotForAtm = Number(
-                      marketData?.context?.nifty_price ?? marketData?.tick?.nifty_price ?? marketData?.spot ?? 0
-                    );
-                    const rows = heatmap;
-                    const atmStrike =
-                      rows.length > 0 && Number.isFinite(spotForAtm) && spotForAtm > 0
-                        ? Number(
-                          rows.reduce((closest, row) => {
-                            const strike = Number(row?.strike ?? 0);
-                            if (!Number.isFinite(strike) || strike <= 0) return closest;
-                            return Math.abs(strike - spotForAtm) < Math.abs(closest - spotForAtm) ? strike : closest;
-                          }, Number(rows[0]?.strike ?? 0))
-                        )
-                        : null;
-
-                    return rows.map((row, idx) => {
-                      const strike = Number(row?.strike ?? 0);
-                      const isAtm = atmStrike !== null && Number.isFinite(strike) && strike === atmStrike;
-                      return (
-                    <tr key={idx} className={isAtm ? "atmRow" : ""}>
-                      <td style={{ fontWeight: 600 }}>
-                        {row.strike}
-                        {isAtm && <span className="atm-line" title="ATM strike" />}
-                      </td>
-                      <td>{Number(row.ce_oi || 0).toLocaleString()}</td>
-                      <td>{Number(row.pe_oi || 0).toLocaleString()}</td>
-                      <td>{(Number(row.ce_oi || 0) + Number(row.pe_oi || 0)).toLocaleString()}</td>
-                      <td className="ltpCell">
-                        <span className="ltpValue">{Number(row.ce_ltp || 0) > 0 ? Number(row.ce_ltp).toFixed(2) : "-"}</span>
-                      </td>
-                      <td className="ltpCell">
-                        <span className="ltpValue">{Number(row.pe_ltp || 0) > 0 ? Number(row.pe_ltp).toFixed(2) : "-"}</span>
-                      </td>
-                    </tr>
-                    );
-                  });
-                  })()}
-                </tbody>
-              </table>
-            </div>
-          ) : (
-            <EmptyState message="No heatmap data" />
-          )}
-        </article>
-
         {/* Order Blotter */}
-        <article className="panel full tilt-card entry-animate">
+        <article className="panel full tilt-card gsap-panel">
           <div className="section-badge">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
@@ -1028,7 +846,7 @@ function App() {
         </article>
 
         {/* Audit Log */}
-        <article className="panel full tilt-card entry-animate">
+        <article className="panel full tilt-card gsap-panel">
           <div className="section-badge">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <path d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
@@ -1046,15 +864,27 @@ function App() {
               ))}
             </ul>
           ) : auditEvents && auditEvents.length > 0 ? (
-            <ul className="event-list" style={{ listStyle: "none", padding: 0, margin: 0, fontSize: "0.9rem" }}>
-              {auditEvents.slice(0, 15).map((evt, idx) => (
-                <li key={idx} style={{ padding: "8px 0", borderBottom: "1px solid var(--line)", display: "flex", justifyContent: "space-between" }}>
-                  <span>{evt.event_type || evt.type || "Event"}</span>
-                  <span style={{ color: "var(--muted)", fontSize: "0.8rem" }}>
-                    {new Date(evt.timestamp).toLocaleTimeString()}
-                  </span>
-                </li>
-              ))}
+            <ul className="event-list" style={{ listStyle: "none", padding: 0, margin: 0, fontSize: "0.88rem" }}>
+              {auditEvents.slice(0, 15).map((evt, idx) => {
+                const detail = String(
+                  evt.message || evt.reason || evt.payload?.reason || evt.payload?.message || ""
+                ).replace(/^LLM unavailable[^.]*\.\s*/i, "").trim();
+                return (
+                  <li key={idx} style={{ padding: "10px 0", borderBottom: "1px solid var(--line)", display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: "12px" }}>
+                    <div>
+                      <div style={{ fontWeight: 600, color: "var(--ink)" }}>{evt.event_type || evt.type || "Event"}</div>
+                      {detail && (
+                        <div style={{ fontSize: "0.78rem", color: "var(--muted)", marginTop: "3px", lineHeight: 1.4 }}>
+                          {detail.length > 100 ? detail.slice(0, 100) + "…" : detail}
+                        </div>
+                      )}
+                    </div>
+                    <span style={{ color: "var(--muted)", fontSize: "0.78rem", flexShrink: 0, paddingTop: "2px" }}>
+                      {new Date(evt.timestamp).toLocaleTimeString()}
+                    </span>
+                  </li>
+                );
+              })}
             </ul>
           ) : (
             <EmptyState message="No events" />
@@ -1067,12 +897,19 @@ function App() {
 
   return (
     <div className="page">
-      <header style={{ marginBottom: "24px", display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: "24px" }}>
-        <div style={{ flex: 1 }}>
-          <h1 className="gradient-text" style={{ fontSize: "2rem", margin: "0 0 8px 0" }}>Jugal's AI Options Desk</h1>
-          <p style={{ color: "var(--muted)", margin: 0 }}>Advanced options trading analytics powered by AI</p>
+      <Suspense fallback={null}>
+        <ThreeBackground />
+      </Suspense>
+      <header style={{ marginBottom: "28px", display: "flex", justifyContent: "space-between", alignItems: "flex-end", gap: "24px", flexWrap: "wrap" }}>
+        <div className="masthead" style={{ flex: 1, minWidth: "280px" }}>
+          <span className="eyebrow-luxe hero-subtitle">
+            <span className="live-dot" aria-hidden="true" />
+            NSE Derivatives · Algorithmic Desk
+          </span>
+          <h1 className="gradient-text hero-title">AI Options Desk</h1>
+          <p className="hero-subtitle masthead-sub">Advanced options trading analytics powered by AI</p>
         </div>
-        <div style={{ flexShrink: 0 }}>
+        <div className="hero-controls" style={{ flexShrink: 0 }}>
           <HeaderControls
             controls={controls}
             loadingStates={loadingStates}
@@ -1085,7 +922,13 @@ function App() {
 
       <div className="gradient-divider"></div>
 
-      {currentPage === "dashboard" ? renderDashboard() : <DayWisePnlPage pnl={pnlData} />}
+      {currentPage === "dashboard" ? (
+        renderDashboard()
+      ) : (
+        <Suspense fallback={<div className="panel"><Skeleton height="120px" /></div>}>
+          <DayWisePnlPage pnl={pnlData} />
+        </Suspense>
+      )}
     </div>
   );
 }
